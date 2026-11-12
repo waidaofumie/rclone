@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -195,9 +196,7 @@ func (op *kvPut) Do(ctx context.Context, b kv.Bucket) (err error) {
 		r.Fp = op.fp
 	}
 
-	for hashType, hashVal := range op.hashes {
-		r.Hashes[hashType] = hashVal
-	}
+	maps.Copy(r.Hashes, op.hashes)
 	if data, err = r.encode(op.key); err != nil {
 		return fmt.Errorf("marshal failed: %w", err)
 	}
@@ -205,6 +204,34 @@ func (op *kvPut) Do(ctx context.Context, b kv.Bucket) (err error) {
 		return fmt.Errorf("put failed: %w", err)
 	}
 	return err
+}
+
+// kvUpdateFingerprint: rewrite the fingerprint of an existing record
+type kvUpdateFingerprint struct {
+	key   string
+	oldFp string
+	newFp string
+	age   time.Duration
+}
+
+func (op *kvUpdateFingerprint) Do(ctx context.Context, b kv.Bucket) error {
+	data := b.Get([]byte(op.key))
+	if len(data) == 0 {
+		return nil
+	}
+	var r hashRecord
+	if err := r.decode(op.key, data); err != nil {
+		return nil
+	}
+	if r.Fp != op.oldFp || time.Since(r.Created) > op.age {
+		return nil
+	}
+	r.Fp = op.newFp
+	data, err := r.encode(op.key)
+	if err != nil {
+		return err
+	}
+	return b.Put([]byte(op.key), data)
 }
 
 // kvDump: dump the database.

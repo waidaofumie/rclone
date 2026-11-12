@@ -11,7 +11,9 @@ import (
 
 const versionFormat = "-v2006-01-02-150405.000"
 
-var versionRegexp = regexp.MustCompile("-v\\d{4}-\\d{2}-\\d{2}-\\d{6}-\\d{3}")
+// versionRegexp matches a version string at the end of a base name,
+// which is the only place Add puts it and Remove looks for it.
+var versionRegexp = regexp.MustCompile(`-v\d{4}-\d{2}-\d{2}-\d{6}-\d{3}$`)
 
 // Split fileName into base and extension so that base + ext == fileName
 func splitExt(fileName string) (base, ext string) {
@@ -30,7 +32,7 @@ func Add(fileName string, t time.Time) string {
 	base, ext := splitExt(fileName)
 	s := t.Format(versionFormat)
 	// Replace the '.' with a '-'
-	s = strings.Replace(s, ".", "-", -1)
+	s = strings.ReplaceAll(s, ".", "-")
 	return base + s + ext
 }
 
@@ -57,6 +59,11 @@ func Remove(fileName string) (t time.Time, fileNameWithoutVersion string) {
 }
 
 // Match returns true if the fileName has a version string
+//
+// The version string must be where Add puts it: at the end of the
+// file name, just before the extension. A version-like string in the
+// middle of the name or in a parent directory is not a version.
 func Match(fileName string) bool {
-	return versionRegexp.MatchString(fileName)
+	base, _ := splitExt(fileName)
+	return versionRegexp.MatchString(base)
 }

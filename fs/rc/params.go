@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net/http"
 	"strconv"
@@ -15,7 +16,7 @@ import (
 )
 
 // Params is the input and output type for the Func
-type Params map[string]interface{}
+type Params map[string]any
 
 // ErrParamNotFound - this is returned from the Get* functions if the
 // parameter isn't found along with a zero value of the requested
@@ -48,7 +49,6 @@ func NotErrParamNotFound(err error) bool {
 // ErrParamInvalid - this is returned from the Get* functions if the
 // parameter is invalid.
 //
-//
 // Returning an error of this type from an rc.Func will cause the http
 // method to return http.StatusBadRequest
 type ErrParamInvalid struct {
@@ -71,7 +71,7 @@ func IsErrParamInvalid(err error) bool {
 // out should be a pointer type
 //
 // This isn't a very efficient way of dealing with this!
-func Reshape(out interface{}, in interface{}) error {
+func Reshape(out any, in any) error {
 	b, err := json.Marshal(in)
 	if err != nil {
 		return fmt.Errorf("Reshape failed to Marshal: %w", err)
@@ -86,9 +86,7 @@ func Reshape(out interface{}, in interface{}) error {
 // Copy shallow copies the Params
 func (p Params) Copy() (out Params) {
 	out = make(Params, len(p))
-	for k, v := range p {
-		out[k] = v
-	}
+	maps.Copy(out, p)
 	return out
 }
 
@@ -96,7 +94,7 @@ func (p Params) Copy() (out Params) {
 //
 // If the parameter isn't found then error will be of type
 // ErrParamNotFound and the returned value will be nil.
-func (p Params) Get(key string) (interface{}, error) {
+func (p Params) Get(key string) (any, error) {
 	value, ok := p[key]
 	if !ok {
 		return nil, ErrParamNotFound(key)
@@ -169,18 +167,35 @@ func (p Params) GetInt64(key string) (int64, error) {
 	case int64:
 		return x, nil
 	case float64:
-		if x > math.MaxInt64 || x < math.MinInt64 {
+		// float64(math.MaxInt64) rounds up to 2**63 which doesn't fit in an int64
+		if x >= math.MaxInt64 || x < math.MinInt64 {
 			return 0, ErrParamInvalid{fmt.Errorf("key %q (%v) overflows int64 ", key, value)}
 		}
 		return int64(x), nil
 	case string:
-		i, err := strconv.ParseInt(x, 10, 0)
+		i, err := strconv.ParseInt(x, 10, 64)
 		if err != nil {
 			return 0, ErrParamInvalid{fmt.Errorf("couldn't parse key %q (%v) as int64: %w", key, value, err)}
 		}
 		return i, nil
 	}
 	return 0, ErrParamInvalid{fmt.Errorf("expecting int64 value for key %q (was %T)", key, value)}
+}
+
+// GetInt gets an int parameter from the input
+//
+// If the parameter isn't found then error will be of type
+// ErrParamNotFound and the returned value will be 0. If the value
+// doesn't fit in an int then the error will be of type ErrParamInvalid.
+func (p Params) GetInt(key string) (int, error) {
+	i, err := p.GetInt64(key)
+	if err != nil {
+		return 0, err
+	}
+	if i > math.MaxInt || i < math.MinInt {
+		return 0, ErrParamInvalid{fmt.Errorf("key %q (%v) overflows int", key, i)}
+	}
+	return int(i), nil
 }
 
 // GetFloat64 gets a float64 parameter from the input
@@ -242,7 +257,7 @@ func (p Params) GetBool(key string) (bool, error) {
 //
 // If the parameter isn't found then error will be of type
 // ErrParamNotFound and out will be unchanged.
-func (p Params) GetStruct(key string, out interface{}) error {
+func (p Params) GetStruct(key string, out any) error {
 	value, err := p.Get(key)
 	if err != nil {
 		return err
@@ -263,7 +278,7 @@ func (p Params) GetStruct(key string, out interface{}) error {
 
 // GetStructMissingOK works like GetStruct but doesn't return an error
 // if the key is missing
-func (p Params) GetStructMissingOK(key string, out interface{}) error {
+func (p Params) GetStructMissingOK(key string, out any) error {
 	_, ok := p[key]
 	if !ok {
 		return nil
@@ -282,6 +297,12 @@ func (p Params) GetDuration(key string) (time.Duration, error) {
 		return 0, ErrParamInvalid{fmt.Errorf("parse duration: %w", err)}
 	}
 	return duration, nil
+}
+
+// GetFsDuration get the duration parameters from in
+func (p Params) GetFsDuration(key string) (fs.Duration, error) {
+	d, err := p.GetDuration(key)
+	return fs.Duration(d), err
 }
 
 // Error creates the standard response for an errored rc call using an

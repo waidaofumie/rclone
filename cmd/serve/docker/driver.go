@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -13,15 +12,19 @@ import (
 	"sync"
 	"time"
 
-	sysdnotify "github.com/iguanesolutions/go-systemd/v5/notify"
-
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/file"
 	"github.com/rclone/rclone/vfs/vfscommon"
-	"github.com/rclone/rclone/vfs/vfsflags"
+)
+
+const (
+	// volTimeout is the maximum time to wait for a single volume to
+	// be restored (filesystem setup) during plugin startup.
+	volTimeout = 30 * time.Second
 )
 
 // Driver implements docker driver api
@@ -47,17 +50,12 @@ func NewDriver(ctx context.Context, root string, mntOpt *mountlib.Options, vfsOp
 		return nil, fmt.Errorf("failed to create cache directory: %s: %w", cacheDir, err)
 	}
 
-	//err = file.MkdirAll(root, 0755)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create mount root: %s: %w", root, err)
-	}
-
 	// setup driver state
 	if mntOpt == nil {
 		mntOpt = &mountlib.Opt
 	}
 	if vfsOpt == nil {
-		vfsOpt = &vfsflags.Opt
+		vfsOpt = &vfscommon.Opt
 	}
 	drv := &Driver{
 		root:      root,
@@ -69,6 +67,12 @@ func NewDriver(ctx context.Context, root string, mntOpt *mountlib.Options, vfsOp
 	}
 	drv.mntOpt.Daemon = false
 
+	// start mount monitoring - must be before restoreState since
+	// restoring mounts sends on monChan
+	drv.hupChan = make(chan os.Signal, 1)
+	drv.monChan = make(chan bool, 1)
+	go drv.monitor()
+
 	// restore from saved state
 	if !forgetState {
 		if err = drv.restoreState(ctx); err != nil {
@@ -76,19 +80,13 @@ func NewDriver(ctx context.Context, root string, mntOpt *mountlib.Options, vfsOp
 		}
 	}
 
-	// start mount monitoring
-	drv.hupChan = make(chan os.Signal, 1)
-	drv.monChan = make(chan bool, 1)
-	mountlib.NotifyOnSigHup(drv.hupChan)
-	go drv.monitor()
-
 	// unmount all volumes on exit
 	atexit.Register(func() {
 		drv.exitOnce.Do(drv.Exit)
 	})
 
 	// notify systemd
-	if err := sysdnotify.Ready(); err != nil {
+	if _, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
 		return nil, fmt.Errorf("failed to notify systemd: %w", err)
 	}
 
@@ -101,7 +99,10 @@ func (drv *Driver) Exit() {
 	drv.mu.Lock()
 	defer drv.mu.Unlock()
 
-	reportErr(sysdnotify.Stopping())
+	reportErr(func() error {
+		_, err := daemon.SdNotify(false, daemon.SdNotifyStopping)
+		return err
+	}())
 	drv.monChan <- true // ask monitor to exit
 	for _, vol := range drv.volumes {
 		reportErr(vol.unmountAll())
@@ -181,8 +182,12 @@ func reportErr(err error) {
 	}
 }
 
-// Create volume
-// To use subpath we are limited to defining a new volume definition via alias
+// Create volume.
+//
+// If the volume already exists, the request is treated as a no-op
+// (idempotent) so that Docker can safely re-send Create requests
+// after a plugin restart without getting "volume already exists".
+// To use subpath we are limited to defining a new volume definition via alias.
 func (drv *Driver) Create(req *CreateRequest) error {
 	ctx := context.Background()
 	drv.mu.Lock()
@@ -192,7 +197,8 @@ func (drv *Driver) Create(req *CreateRequest) error {
 	fs.Debugf(nil, "Create volume %q", name)
 
 	if vol, _ := drv.getVolume(name); vol != nil {
-		return ErrVolumeExists
+		fs.Debugf(nil, "Volume %q already exists, treating Create as no-op", name)
+		return nil
 	}
 
 	vol, err := newVolume(ctx, name, req.Options, drv)
@@ -329,7 +335,7 @@ func (drv *Driver) saveState() error {
 	ctx := context.Background()
 	retries := fs.GetConfig(ctx).LowLevelRetries
 	for i := 0; i <= retries; i++ {
-		err = ioutil.WriteFile(drv.statePath, data, 0600)
+		err = os.WriteFile(drv.statePath, data, 0600)
 		if err == nil {
 			return nil
 		}
@@ -338,11 +344,15 @@ func (drv *Driver) saveState() error {
 	return fmt.Errorf("failed to save state: %w", err)
 }
 
-// restoreState recreates volumes from saved driver state
+// restoreState recreates volumes from saved driver state.
+//
+// It restores volume metadata and filesystems but defers the actual
+// FUSE mounts. Call restoreMounts afterwards (typically after the
+// server socket is listening) to perform the mounts.
 func (drv *Driver) restoreState(ctx context.Context) error {
 	fs.Debugf(nil, "Restore state from %s", drv.statePath)
 
-	data, err := ioutil.ReadFile(drv.statePath)
+	data, err := os.ReadFile(drv.statePath)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -356,12 +366,73 @@ func (drv *Driver) restoreState(ctx context.Context) error {
 		return nil
 	}
 
-	for _, vol := range state {
-		if err := vol.restoreState(ctx, drv); err != nil {
-			fs.Logf(nil, "Failed to restore volume %q: %v", vol.Name, err)
+	// Restore volumes concurrently so one slow remote doesn't
+	// block restoring the others.
+	type result struct {
+		vol *Volume
+		err error
+	}
+	results := make([]result, len(state))
+	var wg sync.WaitGroup
+	for i, vol := range state {
+		wg.Add(1)
+		go func(i int, vol *Volume) {
+			defer wg.Done()
+			// Use a timeout so that a slow or unreachable remote does
+			// not block the plugin from starting up.
+			volCtx, cancel := context.WithTimeout(ctx, volTimeout)
+			defer cancel()
+			results[i] = result{vol: vol, err: vol.restoreState(volCtx, drv)}
+		}(i, vol)
+	}
+	wg.Wait()
+
+	for _, r := range results {
+		if r.err != nil {
+			fs.Logf(nil, "Failed to restore volume %q: %v", r.vol.Name, r.err)
 			continue
 		}
-		drv.volumes[vol.Name] = vol
+		drv.volumes[r.vol.Name] = r.vol
 	}
 	return nil
+}
+
+// RestoreMounts mounts all volumes that were previously mounted.
+//
+// This should be called after the server socket is listening so that
+// Docker can communicate with the plugin even if individual mounts
+// are slow or fail. Mounts are performed concurrently.
+func (drv *Driver) RestoreMounts() {
+	// Collect pending mounts under the lock
+	type pendingMount struct {
+		vol    *Volume
+		mounts []string
+	}
+	drv.mu.Lock()
+	var pending []pendingMount
+	for _, vol := range drv.volumes {
+		mounts := vol.getPendingMounts()
+		if len(mounts) > 0 {
+			pending = append(pending, pendingMount{vol: vol, mounts: mounts})
+		}
+	}
+	drv.mu.Unlock()
+
+	// Mount concurrently without holding the driver lock
+	var wg sync.WaitGroup
+	for _, p := range pending {
+		wg.Add(1)
+		go func(vol *Volume, mounts []string) {
+			defer wg.Done()
+			for _, id := range mounts {
+				drv.mu.Lock()
+				err := vol.mount(id)
+				drv.mu.Unlock()
+				if err != nil {
+					fs.Logf(nil, "Failed to restore mount %q for volume %q: %v", id, vol.Name, err)
+				}
+			}
+		}(p.vol, p.mounts)
+	}
+	wg.Wait()
 }

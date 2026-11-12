@@ -5,10 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/url"
-	"os"
-	"syscall"
 	"testing"
 	"time"
 
@@ -41,19 +38,7 @@ func wrap(err error, message string) error {
 
 var errUseOfClosedNetworkConnection = errors.New("use of closed network connection")
 
-// make a plausible network error with the underlying errno
-func makeNetErr(errno syscall.Errno) error {
-	return &net.OpError{
-		Op:     "write",
-		Net:    "tcp",
-		Source: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 123},
-		Addr:   &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080},
-		Err: &os.SyscallError{
-			Syscall: "write",
-			Err:     errno,
-		},
-	}
-}
+var errHTTP2GoAway = errors.New(`http2: server sent GOAWAY and closed the connection; LastStreamID=19999, ErrCode=NO_ERROR, debug=""`)
 
 type myError1 struct {
 	Err error
@@ -121,8 +106,6 @@ func TestCause(t *testing.T) {
 		{fmt.Errorf("potato: %w", errPotato), false, errPotato},
 		{fmt.Errorf("potato2: %w", wrap(errPotato, "potato")), false, errPotato},
 		{errUseOfClosedNetworkConnection, false, errUseOfClosedNetworkConnection},
-		{makeNetErr(syscall.EAGAIN), true, syscall.EAGAIN},
-		{makeNetErr(syscall.Errno(123123123)), false, syscall.Errno(123123123)},
 		{eNil1, false, eNil1},
 		{eNil2, false, eNil2.Err},
 		{myError1{io.EOF}, false, io.EOF},
@@ -151,27 +134,11 @@ func TestShouldRetry(t *testing.T) {
 		{fmt.Errorf("connection: %w", errUseOfClosedNetworkConnection), true},
 		{io.EOF, true},
 		{io.ErrUnexpectedEOF, true},
-		{makeNetErr(syscall.EAGAIN), true},
-		{makeNetErr(syscall.Errno(123123123)), false},
 		{&url.Error{Op: "post", URL: "/", Err: io.EOF}, true},
 		{&url.Error{Op: "post", URL: "/", Err: errUseOfClosedNetworkConnection}, true},
 		{&url.Error{Op: "post", URL: "/", Err: fmt.Errorf("net/http: HTTP/1.x transport connection broken: %v", fmt.Errorf("http: ContentLength=%d with Body length %d", 100663336, 99590598))}, true},
-		{
-			wrap(&url.Error{
-				Op:  "post",
-				URL: "http://localhost/",
-				Err: makeNetErr(syscall.EPIPE),
-			}, "potato error"),
-			true,
-		},
-		{
-			wrap(&url.Error{
-				Op:  "post",
-				URL: "http://localhost/",
-				Err: makeNetErr(syscall.Errno(123123123)),
-			}, "listing error"),
-			false,
-		},
+		{errHTTP2GoAway, true},
+		{fmt.Errorf("operation error S3: ListObjectsV2, deserialization failed, failed to decode response body: %w", errHTTP2GoAway), true},
 	} {
 		got := ShouldRetry(test.err)
 		assert.Equal(t, test.want, got, fmt.Sprintf("test #%d: %v", i, test.err))
@@ -181,7 +148,7 @@ func TestShouldRetry(t *testing.T) {
 func TestRetryAfter(t *testing.T) {
 	e := NewErrorRetryAfter(time.Second)
 	after := e.RetryAfter()
-	dt := after.Sub(time.Now())
+	dt := time.Until(after)
 	assert.True(t, dt >= 900*time.Millisecond && dt <= 1100*time.Millisecond)
 	assert.True(t, IsRetryAfterError(e))
 	assert.False(t, IsRetryAfterError(io.EOF))

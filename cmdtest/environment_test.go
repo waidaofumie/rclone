@@ -6,21 +6,21 @@ package cmdtest
 
 import (
 	"os"
+	"regexp"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// TestCmdTest demonstrates and verifies the test functions for end-to-end testing of rclone
+// TestEnvironmentVariables demonstrates and verifies the test functions for end-to-end testing of rclone
 func TestEnvironmentVariables(t *testing.T) {
 
 	createTestEnvironment(t)
-	defer removeTestEnvironment(t)
 
 	testdataPath := createSimpleTestData(t)
-	defer removeSimpleTestData(t)
 
 	// Non backend flags
 	// =================
@@ -48,7 +48,7 @@ func TestEnvironmentVariables(t *testing.T) {
 	env = "RCLONE_LOG_LEVEL=DEBUG"
 	out, err = rcloneEnv(env, "version", "--quiet")
 	if assert.Error(t, err) {
-		assert.Contains(t, out, " DEBUG : ")
+		assert.Contains(t, out, " DEBUG ")
 		assert.Contains(t, out, "Can't set -q and --log-level")
 		assert.Contains(t, "exit status 1", err.Error())
 	}
@@ -68,7 +68,7 @@ func TestEnvironmentVariables(t *testing.T) {
 		assert.NotContains(t, out, "fileAA1.txt") // depth 4
 	}
 
-	// Test of debug logging while initialising flags from environment (tests #5241 Enhance1)
+	// Test of debug logging while initialising flags from environment (tests #5341 Enhance1)
 	env = "RCLONE_STATS=173ms"
 	out, err = rcloneEnv(env, "version", "-vv")
 	if assert.NoError(t, err) {
@@ -81,7 +81,7 @@ func TestEnvironmentVariables(t *testing.T) {
 	// Backend flags and remote name
 	// - The listremotes command includes names from environment variables,
 	//   the part between "RCLONE_CONFIG_" and "_TYPE", converted to lowercase.
-	// - When using using a remote created from env, e.g. with lsd command,
+	// - When using a remote created from env, e.g. with lsd command,
 	//   the name is case insensitive in contrast to remotes in config file
 	//   (fs.ConfigToEnv converts to uppercase before checking environment).
 	// - Previously using a remote created from env, e.g. with lsd command,
@@ -141,13 +141,12 @@ func TestEnvironmentVariables(t *testing.T) {
 	// Reference: https://rclone.org/docs/#precedence
 	// Create a symlink in test data
 	err = os.Symlink(testdataPath+"/folderA", testdataPath+"/symlinkA")
-	if runtime.GOOS == "windows" {
-		errNote := "The policy settings on Windows often prohibit the creation of symlinks due to security issues.\n"
-		errNote += "You can safely ignore this test, if your change didn't affect environment variables."
-		require.NoError(t, err, errNote)
-	} else {
-		require.NoError(t, err)
+	if err != nil && runtime.GOOS == "windows" {
+		// Windows grants the privilege only to an elevated process or one
+		// running with Developer Mode enabled.
+		t.Skipf("Skipping as symlinks are unavailable: %v", err)
 	}
+	require.NoError(t, err)
 
 	// Create a local remote with explicit skip_links=false
 	out, err = rclone("config", "create", "myLocal", "local", "skip_links", "false")
@@ -325,4 +324,63 @@ func TestEnvironmentVariables(t *testing.T) {
 		assert.NotContains(t, out, "fileB1.txt")
 	}
 
+	// Test --use-json-log and -vv combinations
+	jsonLogOK := func() {
+		t.Helper()
+		if assert.NoError(t, err) {
+			assert.Contains(t, out, `"level":"debug"`)
+			assert.Contains(t, out, `"msg":"Version `)
+			assert.Contains(t, out, `"}`)
+		}
+	}
+	env = "RCLONE_USE_JSON_LOG=1;RCLONE_LOG_LEVEL=DEBUG"
+	out, err = rcloneEnv(env, "version")
+	jsonLogOK()
+	env = "RCLONE_USE_JSON_LOG=1"
+	out, err = rcloneEnv(env, "version", "-vv")
+	jsonLogOK()
+	env = "RCLONE_LOG_LEVEL=DEBUG"
+	out, err = rcloneEnv(env, "version", "--use-json-log")
+	jsonLogOK()
+	env = ""
+	out, err = rcloneEnv(env, "version", "-vv", "--use-json-log")
+	jsonLogOK()
+
+	// Find all the File filter lines in out and return them
+	parseFileFilters := func(out string) (extensions []string) {
+		// Match: - (^|/)[^/]*\.jpg$
+		find := regexp.MustCompile(`^- \(\^\|\/\)\[\^\/\]\*\\\.(.*?)\$$`)
+		for line := range strings.SplitSeq(out, "\n") {
+			if m := find.FindStringSubmatch(line); m != nil {
+				extensions = append(extensions, m[1])
+			}
+		}
+		return extensions
+	}
+
+	// Make sure that multiple valued (stringArray) environment variables are handled properly
+	env = ``
+	out, err = rcloneEnv(env, "version", "-vv", "--dump", "filters", "--exclude", "*.gif", "--exclude", "*.tif")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"gif", "tif"}, parseFileFilters(out))
+
+	env = `RCLONE_EXCLUDE=*.jpg`
+	out, err = rcloneEnv(env, "version", "-vv", "--dump", "filters", "--exclude", "*.gif")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"jpg", "gif"}, parseFileFilters(out))
+
+	env = `RCLONE_EXCLUDE=*.jpg,*.png`
+	out, err = rcloneEnv(env, "version", "-vv", "--dump", "filters", "--exclude", "*.gif", "--exclude", "*.tif")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"jpg", "png", "gif", "tif"}, parseFileFilters(out))
+
+	env = `RCLONE_EXCLUDE="*.jpg","*.png"`
+	out, err = rcloneEnv(env, "version", "-vv", "--dump", "filters")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"jpg", "png"}, parseFileFilters(out))
+
+	env = `RCLONE_EXCLUDE="*.,,,","*.png"`
+	out, err = rcloneEnv(env, "version", "-vv", "--dump", "filters")
+	require.NoError(t, err)
+	assert.Equal(t, []string{",,,", "png"}, parseFileFilters(out))
 }

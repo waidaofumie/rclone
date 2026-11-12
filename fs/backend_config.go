@@ -8,8 +8,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/rclone/rclone/fs/config/configmap"
 )
@@ -75,11 +77,11 @@ type ConfigIn struct {
 // Error is displayed to the user before asking a question
 // Result is passed to the next call to Config if Option/OAuth isn't set
 type ConfigOut struct {
-	State  string      // State to jump to after this
-	Option *Option     // Option to query user about
-	OAuth  interface{} `json:"-"` // Do OAuth if set
-	Error  string      // error to be displayed to the user
-	Result string      // if Option/OAuth not set then this is passed to the next state
+	State  string  // State to jump to after this
+	Option *Option // Option to query user about
+	OAuth  any     `json:"-"` // Do OAuth if set
+	Error  string  // error to be displayed to the user
+	Result string  // if Option/OAuth not set then this is passed to the next state
 }
 
 // ConfigInputOptional asks the user for a string which may be empty
@@ -176,7 +178,13 @@ func ConfigConfirm(state string, Default bool, name string, help string) (*Confi
 	}, nil
 }
 
-// ConfigChooseFixed returns a ConfigOut structure which has a list of items to choose from.
+// ConfigChooseExclusiveFixed returns a ConfigOut structure which has a list of
+// items to choose from.
+//
+// Possible items must be supplied as a fixed list.
+//
+// User is required to supply a value, and is restricted to the specified list,
+// i.e. free text input is not allowed.
 //
 // state should be the next state required
 // name is the config name for this item
@@ -185,8 +193,8 @@ func ConfigConfirm(state string, Default bool, name string, help string) (*Confi
 //
 // It chooses the first item to be the default.
 // If there are no items then it will return an error.
-// If there is only one item it will short cut to the next state
-func ConfigChooseFixed(state string, name string, help string, items []OptionExample) (*ConfigOut, error) {
+// If there is only one item it will short cut to the next state.
+func ConfigChooseExclusiveFixed(state string, name string, help string, items []OptionExample) (*ConfigOut, error) {
 	if len(items) == 0 {
 		return nil, fmt.Errorf("no items found in: %s", help)
 	}
@@ -208,7 +216,13 @@ func ConfigChooseFixed(state string, name string, help string, items []OptionExa
 	return choose, nil
 }
 
-// ConfigChoose returns a ConfigOut structure which has a list of items to choose from.
+// ConfigChooseExclusive returns a ConfigOut structure which has a list of
+// items to choose from.
+//
+// Possible items are retrieved from a supplied function.
+//
+// User is required to supply a value, and is restricted to the specified list,
+// i.e. free text input is not allowed.
 //
 // state should be the next state required
 // name is the config name for this item
@@ -218,7 +232,60 @@ func ConfigChooseFixed(state string, name string, help string, items []OptionExa
 //
 // It chooses the first item to be the default.
 // If there are no items then it will return an error.
-// If there is only one item it will short cut to the next state
+// If there is only one item it will short cut to the next state.
+func ConfigChooseExclusive(state string, name string, help string, n int, getItem func(i int) (itemValue string, itemHelp string)) (*ConfigOut, error) {
+	items := make(OptionExamples, n)
+	for i := range items {
+		items[i].Value, items[i].Help = getItem(i)
+	}
+	return ConfigChooseExclusiveFixed(state, name, help, items)
+}
+
+// ConfigChooseFixed returns a ConfigOut structure which has a list of
+// suggested items.
+//
+// Suggested items must be supplied as a fixed list.
+//
+// User is required to supply a value, but is not restricted to the specified
+// list, i.e. free text input is accepted.
+//
+// state should be the next state required
+// name is the config name for this item
+// help should be the help shown to the user
+// items should be the items in the list
+//
+// It chooses the first item to be the default.
+func ConfigChooseFixed(state string, name string, help string, items []OptionExample) (*ConfigOut, error) {
+	choose := &ConfigOut{
+		State: state,
+		Option: &Option{
+			Name:     name,
+			Help:     help,
+			Examples: items,
+			Required: true,
+		},
+	}
+	if len(choose.Option.Examples) > 0 {
+		choose.Option.Default = choose.Option.Examples[0].Value
+	}
+	return choose, nil
+}
+
+// ConfigChoose returns a ConfigOut structure which has a list of suggested
+// items.
+//
+// Suggested items are retrieved from a supplied function.
+//
+// User is required to supply a value, but is not restricted to the specified
+// list, i.e. free text input is accepted.
+//
+// state should be the next state required
+// name is the config name for this item
+// help should be the help shown to the user
+// n should be the number of items in the list
+// getItem should return the items (value, help)
+//
+// It chooses the first item to be the default.
 func ConfigChoose(state string, name string, help string, n int, getItem func(i int) (itemValue string, itemHelp string)) (*ConfigOut, error) {
 	items := make(OptionExamples, n)
 	for i := range items {
@@ -230,7 +297,7 @@ func ConfigChoose(state string, name string, help string, n int, getItem func(i 
 // StatePush pushes a new values onto the front of the config string
 func StatePush(state string, values ...string) string {
 	for i := range values {
-		values[i] = strings.Replace(values[i], ",", "，", -1) // replace comma with unicode wide version
+		values[i] = strings.ReplaceAll(values[i], ",", "，") // replace comma with unicode wide version
 	}
 	if state != "" {
 		values = append(values[:len(values):len(values)], state)
@@ -262,7 +329,7 @@ func StatePop(state string) (newState string, value string) {
 		return "", state
 	}
 	value, newState = state[:comma], state[comma+1:]
-	value = strings.Replace(value, "，", ",", -1) // replace unicode wide comma with comma
+	value = strings.ReplaceAll(value, "，", ",") // replace unicode wide comma with comma
 	return newState, value
 }
 
@@ -311,7 +378,7 @@ func configAll(ctx context.Context, name string, m configmap.Mapper, ri *RegInfo
 	//
 	//     *all-ACTION,NUMBER,ADVANCED
 	//
-	// Where NUMBER is the curent state, ADVANCED is a flag true or false
+	// Where NUMBER is the current state, ADVANCED is a flag true or false
 	// to say whether we are asking about advanced config and
 	// ACTION is what the state should be doing next.
 	stateParams, state := StatePop(in.State)
@@ -396,11 +463,61 @@ func configAll(ctx context.Context, name string, m configmap.Mapper, ri *RegInfo
 	return nil, fmt.Errorf("internal error: bad state %q", state)
 }
 
+// redactDumpAuthWarnOnce makes sure the --dump auth warning is only shown once
+var redactDumpAuthWarnOnce sync.Once
+
+// RedactValue makes value safe for inclusion in the debug log.
+//
+// Non-empty values are replaced with "XXX" as they may contain
+// secrets such as passwords or tokens, unless --dump auth is in use
+// in which case the value is returned quoted.
+func RedactValue(ci *ConfigInfo, value string) string {
+	if value == "" || ci.Dump&DumpAuth != 0 {
+		return fmt.Sprintf("%q", value)
+	}
+	return "XXX"
+}
+
+// RedactOptionValue is like RedactValue except that value is only
+// redacted if opt is unknown (nil), a password or sensitive.
+func RedactOptionValue(ci *ConfigInfo, opt *Option, value string) string {
+	if opt == nil || opt.IsPassword || opt.Sensitive {
+		return RedactValue(ci, value)
+	}
+	return fmt.Sprintf("%q", value)
+}
+
+// redactConfigOut renders out for the debug log, redacting any
+// values which may contain secrets.
+func redactConfigOut(ci *ConfigInfo, out *ConfigOut) string {
+	if out == nil {
+		return "<nil>"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "{State:%q", out.State)
+	if out.Option != nil {
+		fmt.Fprintf(&b, " Option:%s=%s", out.Option.Name, RedactOptionValue(ci, out.Option, out.Option.String()))
+	}
+	if out.OAuth != nil {
+		b.WriteString(" OAuth:set")
+	}
+	if out.Error != "" {
+		fmt.Fprintf(&b, " Error:%q", out.Error)
+	}
+	fmt.Fprintf(&b, " Result:%s}", RedactValue(ci, out.Result))
+	return b.String()
+}
+
 func backendConfigStep(ctx context.Context, name string, m configmap.Mapper, ri *RegInfo, choices configmap.Getter, in ConfigIn) (out *ConfigOut, err error) {
 	ci := GetConfig(ctx)
-	Debugf(name, "config in: state=%q, result=%q", in.State, in.Result)
+	if ci.Dump&DumpAuth != 0 {
+		redactDumpAuthWarnOnce.Do(func() {
+			Logf(nil, "--dump auth is in use - debug output may contain secrets such as passwords and tokens")
+		})
+	}
+	Debugf(name, "config in: state=%q, result=%s", in.State, RedactValue(ci, in.Result))
 	defer func() {
-		Debugf(name, "config out: out=%+v, err=%v", out, err)
+		Debugf(name, "config out: out=%s, err=%v", redactConfigOut(ci, out), err)
 	}()
 
 	switch {
@@ -444,13 +561,13 @@ func backendConfigStep(ctx context.Context, name string, m configmap.Mapper, ri 
 		}
 		// If override value is set in the choices then use that
 		if result, ok := choices.Get(out.Option.Name); ok {
-			Debugf(nil, "Override value found, choosing value %q for state %q", result, out.State)
+			Debugf(nil, "Override value found, choosing value %s for state %q", RedactOptionValue(ci, out.Option, result), out.State)
 			return ConfigResult(out.State, result)
 		}
 		// If AutoConfirm is set, choose the default value
 		if ci.AutoConfirm {
 			result := fmt.Sprint(out.Option.Default)
-			Debugf(nil, "Auto confirm is set, choosing default %q for state %q, override by setting config parameter %q", result, out.State, out.Option.Name)
+			Debugf(nil, "Auto confirm is set, choosing default %s for state %q, override by setting config parameter %q", RedactOptionValue(ci, out.Option, result), out.State, out.Option.Name)
 			return ConfigResult(out.State, result)
 		}
 		// If fs.ConfigEdit is set then make the default value
@@ -461,7 +578,7 @@ func backendConfigStep(ctx context.Context, name string, m configmap.Mapper, ri 
 				oldValue := newOption.Value
 				err = newOption.Set(value)
 				if err != nil {
-					Errorf(nil, "Failed to set %q from %q - using default: %v", out.Option.Name, value, err)
+					Errorf(nil, "Failed to set %q from %s - using default: %v", out.Option.Name, RedactOptionValue(ci, newOption, value), err)
 				} else {
 					newOption.Default = newOption.Value
 					newOption.Value = oldValue
@@ -490,13 +607,7 @@ func MatchProvider(providerConfig, provider string) bool {
 		negate = true
 	}
 	providers := strings.Split(providerConfig, ",")
-	matched := false
-	for _, p := range providers {
-		if p == provider {
-			matched = true
-			break
-		}
-	}
+	matched := slices.Contains(providers, provider)
 	if negate {
 		return !matched
 	}

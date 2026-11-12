@@ -1,6 +1,6 @@
 //go:build !plan9 && !js
-// +build !plan9,!js
 
+// Package cache implements a virtual provider to cache existing remotes.
 package cache
 
 import (
@@ -29,6 +29,7 @@ import (
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/atexit"
@@ -75,17 +76,19 @@ func init() {
 			Name: "plex_url",
 			Help: "The URL of the Plex server.",
 		}, {
-			Name: "plex_username",
-			Help: "The username of the Plex user.",
+			Name:      "plex_username",
+			Help:      "The username of the Plex user.",
+			Sensitive: true,
 		}, {
 			Name:       "plex_password",
 			Help:       "The password of the Plex user.",
 			IsPassword: true,
 		}, {
-			Name:     "plex_token",
-			Help:     "The plex token for authentication - auto set normally.",
-			Hide:     fs.OptionHideBoth,
-			Advanced: true,
+			Name:      "plex_token",
+			Help:      "The plex token for authentication - auto set normally.",
+			Hide:      fs.OptionHideBoth,
+			Advanced:  true,
+			Sensitive: true,
 		}, {
 			Name:     "plex_insecure",
 			Help:     "Skip all certificate verification when connecting to the Plex server.",
@@ -394,7 +397,11 @@ func NewFs(ctx context.Context, name, rootPath string, m configmap.Mapper) (fs.F
 		notifiedRemotes:  make(map[string]bool),
 	}
 	cache.PinUntilFinalized(f.Fs, f)
-	f.rateLimiter = rate.NewLimiter(rate.Limit(float64(opt.Rps)), opt.TotalWorkers)
+	rps := rate.Inf
+	if opt.Rps > 0 {
+		rps = rate.Limit(float64(opt.Rps))
+	}
+	f.rateLimiter = rate.NewLimiter(rps, opt.TotalWorkers)
 
 	f.plexConnector = &plexConnector{}
 	if opt.PlexURL != "" {
@@ -403,18 +410,16 @@ func NewFs(ctx context.Context, name, rootPath string, m configmap.Mapper) (fs.F
 			if err != nil {
 				return nil, fmt.Errorf("failed to connect to the Plex API %v: %w", opt.PlexURL, err)
 			}
-		} else {
-			if opt.PlexPassword != "" && opt.PlexUsername != "" {
-				decPass, err := obscure.Reveal(opt.PlexPassword)
-				if err != nil {
-					decPass = opt.PlexPassword
-				}
-				f.plexConnector, err = newPlexConnector(f, opt.PlexURL, opt.PlexUsername, decPass, opt.PlexInsecure, func(token string) {
-					m.Set("plex_token", token)
-				})
-				if err != nil {
-					return nil, fmt.Errorf("failed to connect to the Plex API %v: %w", opt.PlexURL, err)
-				}
+		} else if opt.PlexPassword != "" && opt.PlexUsername != "" {
+			decPass, err := obscure.Reveal(opt.PlexPassword)
+			if err != nil {
+				decPass = opt.PlexPassword
+			}
+			f.plexConnector, err = newPlexConnector(f, opt.PlexURL, opt.PlexUsername, decPass, opt.PlexInsecure, func(token string) {
+				m.Set("plex_token", token)
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to connect to the Plex API %v: %w", opt.PlexURL, err)
 			}
 		}
 	}
@@ -498,15 +503,19 @@ func NewFs(ctx context.Context, name, rootPath string, m configmap.Mapper) (fs.F
 	}
 
 	go func() {
+		// Wait on the timer and the stop channel together so that a stop
+		// signalled by StopBackgroundRunners is honoured immediately.
+		timer := time.NewTimer(time.Duration(f.opt.ChunkCleanInterval))
+		defer timer.Stop()
 		for {
-			time.Sleep(time.Duration(f.opt.ChunkCleanInterval))
 			select {
 			case <-f.cleanupChan:
 				fs.Infof(f, "stopping cleanup")
 				return
-			default:
+			case <-timer.C:
 				fs.Debugf(f, "starting cleanup")
 				f.CleanUpCache(false)
+				timer.Reset(time.Duration(f.opt.ChunkCleanInterval))
 			}
 		}
 	}()
@@ -558,9 +567,10 @@ Eg
 	})
 
 	rc.Add(rc.Call{
-		Path:  "cache/stats",
-		Fn:    f.httpStats,
-		Title: "Get cache stats",
+		Path:   "cache/stats",
+		NoAuth: true,
+		Fn:     f.httpStats,
+		Title:  "Get cache stats",
 		Help: `
 Show statistics for the cache remote.
 `,
@@ -679,7 +689,7 @@ func (f *Fs) rcFetch(ctx context.Context, in rc.Params) (rc.Params, error) {
 		start, end int64
 	}
 	parseChunks := func(ranges string) (crs []chunkRange, err error) {
-		for _, part := range strings.Split(ranges, ",") {
+		for part := range strings.SplitSeq(ranges, ",") {
 			var start, end int64 = 0, math.MaxInt64
 			switch ints := strings.Split(part, ":"); len(ints) {
 			case 1:
@@ -1033,7 +1043,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 		fs.Debugf(dir, "list: remove entry: %v", entryRemote)
 	}
-	entries = nil
+	entries = nil //nolint:ineffassign
 
 	// and then iterate over the ones from source (temp Objects will override source ones)
 	var batchDirectories []*Directory
@@ -1082,13 +1092,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return cachedEntries, nil
 }
 
-func (f *Fs) recurse(ctx context.Context, dir string, list *walk.ListRHelper) error {
+func (f *Fs) recurse(ctx context.Context, dir string, list *list.Helper) error {
 	entries, err := f.List(ctx, dir)
 	if err != nil {
 		return err
 	}
 
-	for i := 0; i < len(entries); i++ {
+	for i := range entries {
 		innerDir, ok := entries[i].(fs.Directory)
 		if ok {
 			err := f.recurse(ctx, innerDir.Remote(), list)
@@ -1124,7 +1134,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 				case fs.Directory:
 					_ = f.cache.AddDir(DirectoryFromOriginal(ctx, f, o))
 				default:
-					return fmt.Errorf("Unknown object type %T", entry)
+					return fmt.Errorf("unknown object type %T", entry)
 				}
 			}
 
@@ -1134,7 +1144,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	}
 
 	// if we're here, we're gonna do a standard recursive traversal and cache everything
-	list := walk.NewListRHelper(callback)
+	list := list.NewHelper(callback)
 	err = f.recurse(ctx, dir, list)
 	if err != nil {
 		return err
@@ -1424,7 +1434,7 @@ func (f *Fs) cacheReader(u io.Reader, src fs.ObjectInfo, originalRead func(inn i
 	}()
 
 	// wait until both are done
-	for c := 0; c < 2; c++ {
+	for range 2 {
 		<-done
 	}
 }
@@ -1743,13 +1753,13 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	do := f.Fs.Features().About
 	if do == nil {
-		return nil, errors.New("About not supported")
+		return nil, errors.New("not supported by underlying remote")
 	}
 	return do(ctx)
 }
 
 // Stats returns stats about the cache storage
-func (f *Fs) Stats() (map[string]map[string]interface{}, error) {
+func (f *Fs) Stats() (map[string]map[string]any, error) {
 	return f.cache.Stats()
 }
 
@@ -1782,7 +1792,7 @@ func (f *Fs) CleanUpCache(ignoreLastTs bool) {
 	}
 }
 
-// StopBackgroundRunners will signall all the runners to stop their work
+// StopBackgroundRunners will signal all the runners to stop their work
 // can be triggered from a terminate signal or from testing between runs
 func (f *Fs) StopBackgroundRunners() {
 	f.cleanupChan <- false
@@ -1929,7 +1939,7 @@ var commandHelp = []fs.CommandHelp{
 // The result should be capable of being JSON encoded
 // If it is a string or a []string it will be shown to the user
 // otherwise it will be JSON encoded and shown to the user like that
-func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (interface{}, error) {
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (any, error) {
 	switch name {
 	case "stats":
 		return f.Stats()

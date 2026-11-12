@@ -6,25 +6,31 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
-	"os"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/rclone/rclone/cmd/bisync/bilib"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/fstest/mockfs"
+	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/unicode/norm"
 )
 
 func testCheck(t *testing.T, checkFunction func(ctx context.Context, opt *operations.CheckOpt) error) {
 	r := fstest.NewRun(t)
-	defer r.Finalise()
 	ctx := context.Background()
 	ci := fs.GetConfig(ctx)
 
@@ -65,18 +71,16 @@ func testCheck(t *testing.T, checkFunction func(ctx context.Context, opt *operat
 	check := func(i int, wantErrors int64, wantChecks int64, oneway bool, wantOutput map[string]string) {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			accounting.GlobalStats().ResetCounters()
-			var buf bytes.Buffer
-			log.SetOutput(&buf)
-			defer func() {
-				log.SetOutput(os.Stderr)
-			}()
 			opt := operations.CheckOpt{
 				Fdst:   r.Fremote,
 				Fsrc:   r.Flocal,
 				OneWay: oneway,
 			}
 			addBuffers(&opt)
-			err := checkFunction(ctx, &opt)
+			var err error
+			buf := bilib.CaptureOutput(func() {
+				err = checkFunction(ctx, &opt)
+			})
 			gotErrors := accounting.GlobalStats().GetErrors()
 			gotChecks := accounting.GlobalStats().GetChecks()
 			if wantErrors == 0 && err != nil {
@@ -88,7 +92,7 @@ func testCheck(t *testing.T, checkFunction func(ctx context.Context, opt *operat
 			if wantErrors != gotErrors {
 				t.Errorf("%d: Expecting %d errors but got %d", i, wantErrors, gotErrors)
 			}
-			if gotChecks > 0 && !strings.Contains(buf.String(), "matching files") {
+			if gotChecks > 0 && !strings.Contains(string(buf), "matching files") {
 				t.Errorf("%d: Total files matching line missing", i)
 			}
 			if wantChecks != gotChecks {
@@ -186,11 +190,11 @@ func TestCheck(t *testing.T) {
 
 func TestCheckFsError(t *testing.T) {
 	ctx := context.Background()
-	dstFs, err := fs.NewFs(ctx, "non-existent")
+	dstFs, err := fs.NewFs(ctx, "nonexistent")
 	if err != nil {
 		t.Fatal(err)
 	}
-	srcFs, err := fs.NewFs(ctx, "non-existent")
+	srcFs, err := fs.NewFs(ctx, "nonexistent")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,21 +225,21 @@ func TestCheckEqualReaders(t *testing.T) {
 	b65b[len(b65b)-1] = 1
 	b66 := make([]byte, 66*1024)
 
-	differ, err := operations.CheckEqualReaders(bytes.NewBuffer(b65a), bytes.NewBuffer(b65a))
+	equal, err := operations.CheckEqualReaders(bytes.NewBuffer(b65a), bytes.NewBuffer(b65a))
 	assert.NoError(t, err)
-	assert.Equal(t, differ, false)
+	assert.Equal(t, equal, true)
 
-	differ, err = operations.CheckEqualReaders(bytes.NewBuffer(b65a), bytes.NewBuffer(b65b))
+	equal, err = operations.CheckEqualReaders(bytes.NewBuffer(b65a), bytes.NewBuffer(b65b))
 	assert.NoError(t, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 
-	differ, err = operations.CheckEqualReaders(bytes.NewBuffer(b65a), bytes.NewBuffer(b66))
+	equal, err = operations.CheckEqualReaders(bytes.NewBuffer(b65a), bytes.NewBuffer(b66))
 	assert.NoError(t, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 
-	differ, err = operations.CheckEqualReaders(bytes.NewBuffer(b66), bytes.NewBuffer(b65a))
+	equal, err = operations.CheckEqualReaders(bytes.NewBuffer(b66), bytes.NewBuffer(b65a))
 	assert.NoError(t, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 
 	myErr := errors.New("sentinel")
 	wrap := func(b []byte) io.Reader {
@@ -244,42 +248,41 @@ func TestCheckEqualReaders(t *testing.T) {
 		return io.MultiReader(r, e)
 	}
 
-	differ, err = operations.CheckEqualReaders(wrap(b65a), bytes.NewBuffer(b65a))
+	equal, err = operations.CheckEqualReaders(wrap(b65a), bytes.NewBuffer(b65a))
 	assert.Equal(t, myErr, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 
-	differ, err = operations.CheckEqualReaders(wrap(b65a), bytes.NewBuffer(b65b))
+	equal, err = operations.CheckEqualReaders(wrap(b65a), bytes.NewBuffer(b65b))
 	assert.Equal(t, myErr, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 
-	differ, err = operations.CheckEqualReaders(wrap(b65a), bytes.NewBuffer(b66))
+	equal, err = operations.CheckEqualReaders(wrap(b65a), bytes.NewBuffer(b66))
 	assert.Equal(t, myErr, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 
-	differ, err = operations.CheckEqualReaders(wrap(b66), bytes.NewBuffer(b65a))
+	equal, err = operations.CheckEqualReaders(wrap(b66), bytes.NewBuffer(b65a))
 	assert.Equal(t, myErr, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 
-	differ, err = operations.CheckEqualReaders(bytes.NewBuffer(b65a), wrap(b65a))
+	equal, err = operations.CheckEqualReaders(bytes.NewBuffer(b65a), wrap(b65a))
 	assert.Equal(t, myErr, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 
-	differ, err = operations.CheckEqualReaders(bytes.NewBuffer(b65a), wrap(b65b))
+	equal, err = operations.CheckEqualReaders(bytes.NewBuffer(b65a), wrap(b65b))
 	assert.Equal(t, myErr, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 
-	differ, err = operations.CheckEqualReaders(bytes.NewBuffer(b65a), wrap(b66))
+	equal, err = operations.CheckEqualReaders(bytes.NewBuffer(b65a), wrap(b66))
 	assert.Equal(t, myErr, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 
-	differ, err = operations.CheckEqualReaders(bytes.NewBuffer(b66), wrap(b65a))
+	equal, err = operations.CheckEqualReaders(bytes.NewBuffer(b66), wrap(b65a))
 	assert.Equal(t, myErr, err)
-	assert.Equal(t, differ, true)
+	assert.Equal(t, equal, false)
 }
 
 func TestParseSumFile(t *testing.T) {
 	r := fstest.NewRun(t)
-	defer r.Finalise()
 	ctx := context.Background()
 
 	const sumFile = "test.sum"
@@ -297,6 +300,28 @@ func TestParseSumFile(t *testing.T) {
 		{"7", " \t", " file7 ", false},
 		{"", "  ", "file8", false},
 		{"", "", "file9", false},
+		{"10", "  ", "ファイル10", true},
+		{"#", "  ", "comment11", false},
+		{";", " *", "comment12", false},
+		{"13", " ?SHA1*", "file13", true},
+		{"14", " ?sha1 ", "file14", true},
+		{"15", " ?MD5*", "file15", false},
+		{"16", " *", "file16", false},
+		{"17", " ?SHA1*", "file16", true},
+		{"18", " ?SHA1*", "file18", true},
+		{"19", " *", "file18", false},
+		{"20", " ?*", "file20", false},
+		{"21", "  ", strings.Repeat("dir/", 1100) + "file21", true},
+	}
+
+	encodings := []struct {
+		name string
+		enc  encoding.Encoding
+	}{
+		{"UTF-8", encoding.Nop},
+		{"UTF-8 with BOM", unicode.UTF8BOM},
+		{"UTF-16LE with BOM", unicode.UTF16(unicode.LittleEndian, unicode.UseBOM)},
+		{"UTF-16BE with BOM", unicode.UTF16(unicode.BigEndian, unicode.UseBOM)},
 	}
 
 	for _, eol := range []string{"\n", "\r\n"} {
@@ -309,19 +334,60 @@ func TestParseSumFile(t *testing.T) {
 			}
 		}
 
-		_ = r.WriteObject(ctx, sumFile, data.String(), t1)
-		file, err := r.Fremote.NewObject(ctx, sumFile)
-		assert.NoError(t, err)
-		sums, err := operations.ParseSumFile(ctx, file)
-		assert.NoError(t, err)
+		for _, e := range encodings {
+			content, err := e.enc.NewEncoder().String(data.String())
+			require.NoError(t, err)
 
-		assert.Equal(t, wantNum, len(sums))
-		for _, s := range samples {
-			if s.ok {
-				assert.Equal(t, s.hash, sums[s.name])
+			_ = r.WriteObject(ctx, sumFile, content, t1)
+			file := fstest.NewObject(ctx, t, r.Fremote, sumFile)
+			sums, err := operations.ParseSumFile(ctx, file, hash.SHA1)
+			assert.NoError(t, err)
+
+			assert.Equal(t, wantNum, len(sums), "%s %q", e.name, eol)
+			for _, s := range samples {
+				if s.ok {
+					assert.Equal(t, s.hash, sums[s.name], "%s %q", e.name, eol)
+				}
 			}
 		}
 	}
+
+	// The last line doesn't need a line ending
+	_ = r.WriteObject(ctx, sumFile, "1  file1\n2  file2", t1)
+	file := fstest.NewObject(ctx, t, r.Fremote, sumFile)
+	sums, err := operations.ParseSumFile(ctx, file, hash.SHA1)
+	require.NoError(t, err)
+	assert.Equal(t, operations.HashSums{"file1": "1", "file2": "2"}, sums)
+
+	// A leading backslash marks an escaped file name, as written by GNU md5sum
+	_ = r.WriteObject(ctx, sumFile, strings.Join([]string{
+		`\1  dir\\file1`,
+		`\2 *a\nb\rc`,
+		`\4  invalid\x`,
+		`\5  invalid\`,
+	}, "\n"), t1)
+	file = fstest.NewObject(ctx, t, r.Fremote, sumFile)
+	sums, err = operations.ParseSumFile(ctx, file, hash.SHA1)
+	require.NoError(t, err)
+	assert.Equal(t, operations.HashSums{`dir\file1`: "1", "a\nb\rc": "2"}, sums)
+
+	// Paths are cleaned, and an unescaped backslash is a path separator on Windows
+	_ = r.WriteObject(ctx, sumFile, strings.Join([]string{
+		`1  ./file1`,
+		`2  /dir/file2`,
+		`3  dir//file3`,
+		`4 *dir\file4`,
+		`\5  dir\\file5`,
+	}, "\n"), t1)
+	file = fstest.NewObject(ctx, t, r.Fremote, sumFile)
+	sums, err = operations.ParseSumFile(ctx, file, hash.SHA1)
+	require.NoError(t, err)
+	want := operations.HashSums{"file1": "1", "dir/file2": "2", "dir/file3": "3", `dir\file4`: "4", `dir\file5`: "5"}
+	if runtime.GOOS == "windows" {
+		delete(want, `dir\file4`)
+		want["dir/file4"] = "4"
+	}
+	assert.Equal(t, want, sums)
 }
 
 func testCheckSum(t *testing.T, download bool) {
@@ -342,7 +408,6 @@ func testCheckSum(t *testing.T, download bool) {
 
 	ctx := context.Background()
 	r := fstest.NewRun(t)
-	defer r.Finalise()
 
 	subRemote := r.FremoteName
 	if !strings.HasSuffix(subRemote, ":") {
@@ -392,9 +457,6 @@ func testCheckSum(t *testing.T, download bool) {
 
 	checkRun := func(runNo, wantChecks, wantErrors int, want wantType) {
 		accounting.GlobalStats().ResetCounters()
-		buf := new(bytes.Buffer)
-		log.SetOutput(buf)
-		defer log.SetOutput(os.Stderr)
 
 		opt := operations.CheckOpt{
 			Combined:     new(bytes.Buffer),
@@ -404,8 +466,10 @@ func testCheckSum(t *testing.T, download bool) {
 			MissingOnSrc: new(bytes.Buffer),
 			MissingOnDst: new(bytes.Buffer),
 		}
-		err := operations.CheckSum(ctx, dataFs, r.Fremote, sumFile, hashType, &opt, download)
-
+		var err error
+		buf := bilib.CaptureOutput(func() {
+			err = operations.CheckSum(ctx, dataFs, r.Fremote, sumFile, hashType, &opt, download)
+		})
 		gotErrors := int(accounting.GlobalStats().GetErrors())
 		if wantErrors == 0 {
 			assert.NoError(t, err, "unexpected error in run %d", runNo)
@@ -417,7 +481,7 @@ func testCheckSum(t *testing.T, download bool) {
 
 		gotChecks := int(accounting.GlobalStats().GetChecks())
 		if wantChecks > 0 || gotChecks > 0 {
-			assert.Contains(t, buf.String(), "matching files", "missing matching files in run %d", runNo)
+			assert.Contains(t, string(buf), "matching files", "missing matching files in run %d", runNo)
 		}
 		assert.Equal(t, wantChecks, gotChecks, "wrong number of checks in run %d", runNo)
 
@@ -546,4 +610,193 @@ func TestCheckSum(t *testing.T) {
 
 func TestCheckSumDownload(t *testing.T) {
 	testCheckSum(t, true)
+}
+
+// hashProbe records how many hashing operations are running at once. Each
+// operation blocks until want of them are in flight, or until the deadline
+// expires so a serial implementation finishes instead of deadlocking.
+type hashProbe struct {
+	mu       sync.Mutex
+	inFlight int
+	max      int
+	want     int
+	once     sync.Once
+	reached  chan struct{}
+	timedOut chan struct{}
+}
+
+func newHashProbe(t *testing.T, want int, deadline time.Duration) *hashProbe {
+	p := &hashProbe{
+		want:     want,
+		reached:  make(chan struct{}),
+		timedOut: make(chan struct{}),
+	}
+	timer := time.AfterFunc(deadline, func() { close(p.timedOut) })
+	t.Cleanup(func() { timer.Stop() })
+	return p
+}
+
+func (p *hashProbe) enter() {
+	p.mu.Lock()
+	p.inFlight++
+	p.max = max(p.max, p.inFlight)
+	full := p.inFlight >= p.want
+	p.mu.Unlock()
+	if full {
+		p.once.Do(func() { close(p.reached) })
+	}
+	select {
+	case <-p.reached:
+	case <-p.timedOut:
+	}
+}
+
+func (p *hashProbe) leave() {
+	p.mu.Lock()
+	p.inFlight--
+	p.mu.Unlock()
+}
+
+func (p *hashProbe) maxInFlight() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.max
+}
+
+// probeObject is an object whose hashing is instrumented by a hashProbe
+type probeObject struct {
+	*mockobject.ContentMockObject
+	probe *hashProbe
+}
+
+func (o *probeObject) Hash(ctx context.Context, ht hash.Type) (string, error) {
+	o.probe.enter()
+	defer o.probe.leave()
+	return o.ContentMockObject.Hash(ctx, ht)
+}
+
+func (o *probeObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	o.probe.enter()
+	defer o.probe.leave()
+	return o.ContentMockObject.Open(ctx, options...)
+}
+
+func testCheckSumConcurrency(t *testing.T, download bool) {
+	const (
+		checkers = 2
+		numFiles = 4
+		sumFile  = "test.sum"
+	)
+	hashType := hash.MD5
+
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.Checkers = checkers
+	probe := newHashProbe(t, checkers, 10*time.Second)
+
+	f, err := mockfs.NewFs(ctx, "checkSum", "checkSum", nil)
+	require.NoError(t, err)
+	fsrc := f.(*mockfs.Fs)
+	fsrc.SetHashes(hash.NewHashSet(hashType))
+
+	sums := &bytes.Buffer{}
+	for i := range numFiles {
+		remote := fmt.Sprintf("file%d", i)
+		o := mockobject.New(remote).WithContent([]byte("contents of "+remote), mockobject.SeekModeNone)
+		sum, err := o.Hash(ctx, hashType)
+		require.NoError(t, err)
+		_, _ = fmt.Fprintf(sums, "%s  %s\n", sum, remote)
+		fsrc.AddObject(&probeObject{ContentMockObject: o, probe: probe})
+	}
+
+	f, err = mockfs.NewFs(ctx, "sums", "sums", nil)
+	require.NoError(t, err)
+	fsum := f.(*mockfs.Fs)
+	fsum.AddObject(mockobject.New(sumFile).WithContent(sums.Bytes(), mockobject.SeekModeNone))
+
+	opt := operations.CheckOpt{Combined: new(bytes.Buffer)}
+	require.NoError(t, operations.CheckSum(ctx, fsrc, fsum, sumFile, hashType, &opt, download))
+	assert.Equal(t, checkers, probe.maxInFlight(), "hashing was not run --checkers at a time")
+}
+
+func TestCheckSumConcurrency(t *testing.T) {
+	testCheckSumConcurrency(t, false)
+}
+
+func TestCheckSumDownloadConcurrency(t *testing.T) {
+	testCheckSumConcurrency(t, true)
+}
+
+func TestApplyTransforms(t *testing.T) {
+	var (
+		hashType        = hash.MD5
+		content         = "Hello, World!"
+		hash            = "65a8e27d8879283831b664bd8b7f0ad4"
+		nfc             = norm.NFC.String(norm.NFD.String("測試_Русский___ě_áñ"))
+		nfd             = norm.NFD.String(nfc)
+		nfcx2           = nfc + nfc
+		nfdx2           = nfd + nfd
+		both            = nfc + nfd
+		upper           = "HELLO, WORLD!"
+		lower           = "hello, world!"
+		upperlowermixed = "HeLlO, wOrLd!"
+	)
+
+	testScenario := func(checkfileName, remotefileName, scenario string) {
+		r := fstest.NewRunIndividual(t)
+		ctx := context.Background()
+		ci := fs.GetConfig(ctx)
+		opt := operations.CheckOpt{}
+
+		remotefile := r.WriteObject(ctx, remotefileName, content, t2)
+		// test whether remote is capable of running test
+		entries, err := r.Fremote.List(ctx, "")
+		assert.NoError(t, err)
+		if entries.Len() == 1 && entries[0].Remote() != remotefileName {
+			t.Skipf("Fs is incapable of running test, skipping: %s (expected: %s (%s) actual: %s (%s))", scenario, remotefileName, detectEncoding(remotefileName), entries[0].Remote(), detectEncoding(entries[0].Remote()))
+		}
+
+		checkfile := r.WriteFile("test.sum", hash+"  "+checkfileName, t2)
+		r.CheckLocalItems(t, checkfile)
+		assert.False(t, checkfileName == remotefile.Path, "Values match but should not: %s %s", checkfileName, remotefile.Path)
+
+		testname := scenario + " (without normalization)"
+		println(testname)
+		ci.NoUnicodeNormalization = true
+		ci.IgnoreCaseSync = false
+		accounting.GlobalStats().ResetCounters()
+		err = operations.CheckSum(ctx, r.Fremote, r.Flocal, "test.sum", hashType, &opt, true)
+		assert.Error(t, err, "no expected error for %s %v %v", testname, checkfileName, remotefileName)
+
+		testname = scenario + " (with normalization)"
+		println(testname)
+		ci.NoUnicodeNormalization = false
+		ci.IgnoreCaseSync = true
+		accounting.GlobalStats().ResetCounters()
+		err = operations.CheckSum(ctx, r.Fremote, r.Flocal, "test.sum", hashType, &opt, true)
+		assert.NoError(t, err, "unexpected error for %s %v %v", testname, checkfileName, remotefileName)
+	}
+
+	testScenario(upper, lower, "upper checkfile vs. lower remote")
+	testScenario(lower, upper, "lower checkfile vs. upper remote")
+	testScenario(lower, upperlowermixed, "lower checkfile vs. upperlowermixed remote")
+	testScenario(upperlowermixed, upper, "upperlowermixed checkfile vs. upper remote")
+	testScenario(nfd, nfc, "NFD checkfile vs. NFC remote")
+	testScenario(nfc, nfd, "NFC checkfile vs. NFD remote")
+	testScenario(nfdx2, both, "NFDx2 checkfile vs. both remote")
+	testScenario(nfcx2, both, "NFCx2 checkfile vs. both remote")
+	testScenario(both, nfdx2, "both checkfile vs. NFDx2 remote")
+	testScenario(both, nfcx2, "both checkfile vs. NFCx2 remote")
+}
+
+func detectEncoding(s string) string {
+	if norm.NFC.IsNormalString(s) && norm.NFD.IsNormalString(s) {
+		return "BOTH"
+	}
+	if !norm.NFC.IsNormalString(s) && norm.NFD.IsNormalString(s) {
+		return "NFD"
+	}
+	if norm.NFC.IsNormalString(s) && !norm.NFD.IsNormalString(s) {
+		return "NFC"
+	}
+	return "OTHER"
 }

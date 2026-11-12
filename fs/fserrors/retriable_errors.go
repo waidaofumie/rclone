@@ -1,5 +1,4 @@
 //go:build !plan9
-// +build !plan9
 
 package fserrors
 
@@ -14,6 +13,8 @@ func init() {
 		syscall.ECONNREFUSED,
 		syscall.EHOSTDOWN,
 		syscall.EHOSTUNREACH,
+		syscall.ENETDOWN,
+		syscall.ENETUNREACH,
 		syscall.ECONNABORTED,
 		syscall.EAGAIN,
 		syscall.EWOULDBLOCK,

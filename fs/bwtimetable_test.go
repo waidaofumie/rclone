@@ -9,8 +9,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Check it satisfies the interface
-var _ flagger = (*BwTimetable)(nil)
+// Check it satisfies the interfaces
+var (
+	_ Flagger   = (*BwTimetable)(nil)
+	_ FlaggerNP = BwTimetable{}
+)
 
 func TestBwTimetableSet(t *testing.T) {
 	for _, test := range []struct {
@@ -29,6 +32,10 @@ func TestBwTimetableSet(t *testing.T) {
 		{"bad-10:20,666", BwTimetable{}, true, ""},
 		{"Mon-bad,666", BwTimetable{}, true, ""},
 		{"Mon-10:20,bad", BwTimetable{}, true, ""},
+		{"10h20,666", BwTimetable{}, true, ""},
+		{"Mon-10.20,666", BwTimetable{}, true, ""},
+		{"+1:00,666", BwTimetable{}, true, ""},
+		{"Mon-10:+5,666", BwTimetable{}, true, ""},
 		{
 			"0",
 			BwTimetable{
@@ -253,6 +260,53 @@ func TestBwTimetableSet(t *testing.T) {
 			false,
 			"Mon-00:00,512Ki Sun-12:00,1Mi Mon-12:00,1Mi Tue-12:00,1Mi Wed-12:00,1Mi Thu-12:00,1Mi Fri-12:00,1Mi Sat-12:00,1Mi Sun-20:00,off",
 		},
+		{
+			"11:00,333;13:40,666;23:50,10M;23:59,off",
+			BwTimetable{
+				BwTimeSlot{DayOfTheWeek: 0, HHMM: 1100, Bandwidth: BwPair{Tx: 333 * 1024, Rx: 333 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 1, HHMM: 1100, Bandwidth: BwPair{Tx: 333 * 1024, Rx: 333 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 2, HHMM: 1100, Bandwidth: BwPair{Tx: 333 * 1024, Rx: 333 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 3, HHMM: 1100, Bandwidth: BwPair{Tx: 333 * 1024, Rx: 333 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 4, HHMM: 1100, Bandwidth: BwPair{Tx: 333 * 1024, Rx: 333 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 5, HHMM: 1100, Bandwidth: BwPair{Tx: 333 * 1024, Rx: 333 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 6, HHMM: 1100, Bandwidth: BwPair{Tx: 333 * 1024, Rx: 333 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 0, HHMM: 1340, Bandwidth: BwPair{Tx: 666 * 1024, Rx: 666 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 1, HHMM: 1340, Bandwidth: BwPair{Tx: 666 * 1024, Rx: 666 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 2, HHMM: 1340, Bandwidth: BwPair{Tx: 666 * 1024, Rx: 666 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 3, HHMM: 1340, Bandwidth: BwPair{Tx: 666 * 1024, Rx: 666 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 4, HHMM: 1340, Bandwidth: BwPair{Tx: 666 * 1024, Rx: 666 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 5, HHMM: 1340, Bandwidth: BwPair{Tx: 666 * 1024, Rx: 666 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 6, HHMM: 1340, Bandwidth: BwPair{Tx: 666 * 1024, Rx: 666 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 0, HHMM: 2350, Bandwidth: BwPair{Tx: 10 * 1024 * 1024, Rx: 10 * 1024 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 1, HHMM: 2350, Bandwidth: BwPair{Tx: 10 * 1024 * 1024, Rx: 10 * 1024 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 2, HHMM: 2350, Bandwidth: BwPair{Tx: 10 * 1024 * 1024, Rx: 10 * 1024 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 3, HHMM: 2350, Bandwidth: BwPair{Tx: 10 * 1024 * 1024, Rx: 10 * 1024 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 4, HHMM: 2350, Bandwidth: BwPair{Tx: 10 * 1024 * 1024, Rx: 10 * 1024 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 5, HHMM: 2350, Bandwidth: BwPair{Tx: 10 * 1024 * 1024, Rx: 10 * 1024 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 6, HHMM: 2350, Bandwidth: BwPair{Tx: 10 * 1024 * 1024, Rx: 10 * 1024 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 0, HHMM: 2359, Bandwidth: BwPair{Tx: -1, Rx: -1}},
+				BwTimeSlot{DayOfTheWeek: 1, HHMM: 2359, Bandwidth: BwPair{Tx: -1, Rx: -1}},
+				BwTimeSlot{DayOfTheWeek: 2, HHMM: 2359, Bandwidth: BwPair{Tx: -1, Rx: -1}},
+				BwTimeSlot{DayOfTheWeek: 3, HHMM: 2359, Bandwidth: BwPair{Tx: -1, Rx: -1}},
+				BwTimeSlot{DayOfTheWeek: 4, HHMM: 2359, Bandwidth: BwPair{Tx: -1, Rx: -1}},
+				BwTimeSlot{DayOfTheWeek: 5, HHMM: 2359, Bandwidth: BwPair{Tx: -1, Rx: -1}},
+				BwTimeSlot{DayOfTheWeek: 6, HHMM: 2359, Bandwidth: BwPair{Tx: -1, Rx: -1}},
+			},
+			false,
+			"Sun-11:00,333Ki Mon-11:00,333Ki Tue-11:00,333Ki Wed-11:00,333Ki Thu-11:00,333Ki Fri-11:00,333Ki Sat-11:00,333Ki Sun-13:40,666Ki Mon-13:40,666Ki Tue-13:40,666Ki Wed-13:40,666Ki Thu-13:40,666Ki Fri-13:40,666Ki Sat-13:40,666Ki Sun-23:50,10Mi Mon-23:50,10Mi Tue-23:50,10Mi Wed-23:50,10Mi Thu-23:50,10Mi Fri-23:50,10Mi Sat-23:50,10Mi Sun-23:59,off Mon-23:59,off Tue-23:59,off Wed-23:59,off Thu-23:59,off Fri-23:59,off Sat-23:59,off",
+		},
+		{
+			"Mon-11:00,333;Tue-13:40,666:333;Fri-00:00,10M;Sat-10:00,off;Sun-23:00,666",
+			BwTimetable{
+				BwTimeSlot{DayOfTheWeek: 1, HHMM: 1100, Bandwidth: BwPair{Tx: 333 * 1024, Rx: 333 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 2, HHMM: 1340, Bandwidth: BwPair{Tx: 666 * 1024, Rx: 333 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 5, HHMM: 0000, Bandwidth: BwPair{Tx: 10 * 1024 * 1024, Rx: 10 * 1024 * 1024}},
+				BwTimeSlot{DayOfTheWeek: 6, HHMM: 1000, Bandwidth: BwPair{Tx: -1, Rx: -1}},
+				BwTimeSlot{DayOfTheWeek: 0, HHMM: 2300, Bandwidth: BwPair{Tx: 666 * 1024, Rx: 666 * 1024}},
+			},
+			false,
+			"Mon-11:00,333Ki Tue-13:40,666Ki:333Ki Fri-00:00,10Mi Sat-10:00,off Sun-23:00,666Ki",
+		},
 	} {
 		tt := BwTimetable{}
 		err := tt.Set(test.in)
@@ -264,6 +318,75 @@ func TestBwTimetableSet(t *testing.T) {
 		assert.Equal(t, test.want, tt)
 		assert.Equal(t, test.out, tt.String())
 	}
+}
+
+func TestBwTimetableSetReplaces(t *testing.T) {
+	for _, test := range []struct {
+		first  string
+		second string
+		want   string
+	}{
+		{"Sun-00:00,10M", "Mon-10:00,1M", "Mon-10:00,1Mi"},
+		{"Mon-10:00,1M", "Mon-10:00,1M", "Mon-10:00,1Mi"},
+		{"Mon-10:00,1M", "2M", "2Mi"},
+		{"2M", "Mon-10:00,1M", "Mon-10:00,1Mi"},
+		{"11:00,333;13:40,666", "Mon-10:00,1M", "Mon-10:00,1Mi"},
+	} {
+		tt := BwTimetable{}
+		require.NoError(t, tt.Set(test.first), test.first)
+		require.NoError(t, tt.Set(test.second), test.second)
+		assert.Equal(t, test.want, tt.String(), "%q then %q", test.first, test.second)
+
+		var want BwTimetable
+		require.NoError(t, want.Set(test.second))
+		assert.Equal(t, want, tt, "%q then %q", test.first, test.second)
+	}
+}
+
+func TestBwTimetableStringRoundTrip(t *testing.T) {
+	for _, in := range []string{
+		"1B",
+		"500B",
+		"1023B",
+		"1B:2B",
+		"Mon-10:00,500B",
+		"08:00,512B 12:00,10M 23:00,off",
+		"1M",
+		"1M:100k",
+		"off",
+		"0",
+	} {
+		var tt BwTimetable
+		require.NoError(t, tt.Set(in), in)
+		printed := tt.String()
+
+		var got BwTimetable
+		require.NoError(t, got.Set(printed), "%q printed as %q", in, printed)
+		assert.Equal(t, tt, got, "%q printed as %q", in, printed)
+	}
+}
+
+func TestBwTimetableSetErrorKeepsPrevious(t *testing.T) {
+	for _, in := range []string{
+		"Mon-11:00,333 bad",
+		"Mon-11:00,333 Tue-13:40,bad",
+		"Mon-11:00,333 24:01,666",
+		"11:00,333;bad",
+	} {
+		tt := BwTimetable{}
+		require.NoError(t, tt.Set("Sun-20:00,10M"))
+		require.Error(t, tt.Set(in), in)
+		assert.Equal(t, "Sun-20:00,10Mi", tt.String(), in)
+	}
+}
+
+func TestBwTimetableUnmarshalJSONReplaces(t *testing.T) {
+	var tt BwTimetable
+	require.NoError(t, json.Unmarshal([]byte(`"Sun-00:00,10M"`), &tt))
+	require.NoError(t, json.Unmarshal([]byte(`"Mon-10:00,1M"`), &tt))
+	assert.Equal(t, BwTimetable{
+		BwTimeSlot{DayOfTheWeek: 1, HHMM: 1000, Bandwidth: BwPair{Tx: 1024 * 1024, Rx: 1024 * 1024}},
+	}, tt)
 }
 
 func TestBwTimetableLimitAt(t *testing.T) {
@@ -458,6 +581,14 @@ func TestBwTimetableLimitAt(t *testing.T) {
 			},
 			time.Date(2017, time.April, 17, 10, 59, 0, 0, time.UTC),
 			BwTimeSlot{DayOfTheWeek: 0, HHMM: 2300, Bandwidth: BwPair{Tx: 666 * 1024, Rx: 66 * 1024}},
+		},
+		{
+			BwTimetable{
+				BwTimeSlot{DayOfTheWeek: 6, HHMM: 0000, Bandwidth: BwPair{Tx: -1, Rx: -1}},
+				BwTimeSlot{DayOfTheWeek: 1, HHMM: 0000, Bandwidth: BwPair{Tx: 1024 * 1024, Rx: 1024 * 1024}},
+			},
+			time.Date(2017, time.April, 23, 10, 0, 0, 0, time.UTC),
+			BwTimeSlot{DayOfTheWeek: 6, HHMM: 0000, Bandwidth: BwPair{Tx: -1, Rx: -1}},
 		},
 	} {
 		slot := test.tt.LimitAt(test.now)

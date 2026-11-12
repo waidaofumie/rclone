@@ -1,3 +1,4 @@
+// Package downloaders provides utilities for the VFS layer
 package downloaders
 
 import (
@@ -101,11 +102,11 @@ type downloader struct {
 }
 
 // New makes a downloader for item
-func New(item Item, opt *vfscommon.Options, remote string, src fs.Object) (dls *Downloaders) {
+func New(ctx context.Context, item Item, opt *vfscommon.Options, remote string, src fs.Object) (dls *Downloaders) {
 	if src == nil {
 		panic("internal error: newDownloaders called with nil src object")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	dls = &Downloaders{
 		ctx:    ctx,
 		cancel: cancel,
@@ -114,21 +115,21 @@ func New(item Item, opt *vfscommon.Options, remote string, src fs.Object) (dls *
 		src:    src,
 		remote: remote,
 	}
-	dls.wg.Add(1)
-	go func() {
-		defer dls.wg.Done()
+	dls.wg.Go(func() {
 		ticker := time.NewTicker(backgroundKickerInterval)
-		select {
-		case <-ticker.C:
-			err := dls.kickWaiters()
-			if err != nil {
-				fs.Errorf(dls.src, "vfs cache: failed to kick waiters: %v", err)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				err := dls.kickWaiters()
+				if err != nil {
+					fs.Errorf(dls.src, "vfs cache: failed to kick waiters: %v", err)
+				}
+			case <-ctx.Done():
+				return
 			}
-		case <-ctx.Done():
-			break
 		}
-		ticker.Stop()
-	}()
+	})
 
 	return dls
 }
@@ -137,8 +138,8 @@ func New(item Item, opt *vfscommon.Options, remote string, src fs.Object) (dls *
 //
 // It should be called with
 //
-//   n bytes downloaded
-//   err is error from download
+//	n bytes downloaded
+//	err is error from download
 //
 // call with lock held
 func (dls *Downloaders) _countErrors(n int64, err error) {
@@ -188,9 +189,7 @@ func (dls *Downloaders) _newDownloader(r ranges.Range) (dl *downloader, err erro
 
 	dls.dls = append(dls.dls, dl)
 
-	dl.wg.Add(1)
-	go func() {
-		defer dl.wg.Done()
+	dl.wg.Go(func() {
 		n, err := dl.download()
 		_ = dl.close(err)
 		dl.dls.countErrors(n, err)
@@ -201,7 +200,7 @@ func (dls *Downloaders) _newDownloader(r ranges.Range) (dl *downloader, err erro
 		if err != nil {
 			fs.Errorf(dl.dls.src, "vfs cache: failed to kick waiters: %v", err)
 		}
-	}()
+	})
 
 	return dl, nil
 }
@@ -287,7 +286,7 @@ func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 	// defer log.Trace(dls.src, "r=%v", r)("err=%v", &err)
 
 	// The window includes potentially unread data in the buffer
-	window := int64(fs.GetConfig(context.TODO()).BufferSize)
+	window := int64(fs.GetConfig(dls.ctx).BufferSize)
 
 	// Increase the read range by the read ahead if set
 	if dls.opt.ReadAhead > 0 {
@@ -344,7 +343,7 @@ func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 		start, offset := dl.getRange()
 
 		// The downloader's offset to offset+window is the gap
-		// in which we would like to re-use this
+		// in which we would like to reuse this
 		// downloader. The downloader will never reach before
 		// start and offset+windows is too far away - we'd
 		// rather start another downloader.
@@ -358,8 +357,12 @@ func (dls *Downloaders) _ensureDownloader(r ranges.Range) (err error) {
 	if !startNew {
 		return nil
 	}
+	// Size can be 0 here if file shrinks - no need to download
+	if r.Size == 0 {
+		return nil
+	}
 	// Downloader not found so start a new one
-	dl, err = dls._newDownloader(r)
+	_, err = dls._newDownloader(r)
 	if err != nil {
 		dls._countErrors(0, err)
 		return fmt.Errorf("failed to start downloader: %w", err)
@@ -388,7 +391,14 @@ func (dls *Downloaders) _dispatchWaiters() {
 
 	newWaiters := dls.waiters[:0]
 	for _, waiter := range dls.waiters {
-		if dls.item.HasRange(waiter.r) {
+		// Clip the size against the actual size in case it has shrunk
+		r := waiter.r
+		r.Clip(dls.src.Size())
+		// Wake the waiter if its data has arrived, or if there is nothing
+		// left to download for it. _ensureDownloader starts a downloader
+		// only when FindMissing is non empty, so a waiter with nothing
+		// missing would otherwise never be woken by anything.
+		if dls.item.HasRange(r) || dls.item.FindMissing(waiter.r).IsEmpty() {
 			waiter.errChan <- nil
 		} else {
 			newWaiters = append(newWaiters, waiter)
@@ -400,6 +410,7 @@ func (dls *Downloaders) _dispatchWaiters() {
 // Send any waiters which have completed back to their callers and make sure
 // there is a downloader appropriate for each waiter
 func (dls *Downloaders) kickWaiters() (err error) {
+	defer vfscommon.RecoverPanic(dls.src, &err)
 	dls.mu.Lock()
 	defer dls.mu.Unlock()
 
@@ -446,15 +457,18 @@ func (dl *downloader) Write(p []byte) (n int, err error) {
 	// defer log.Trace(dl.dls.src, "p_len=%d", len(p))("n=%d, err=%v", &n, &err)
 
 	// Kick the waiters on exit if some characters received
+	//
+	// Only logs kickWaiters failures rather than returning them as this
+	// Write's own error: kickWaiters can return the downloaders' stale
+	// accumulated lastErr, which would otherwise fail this write (even
+	// when it succeeded) and get wrapped again by download(), growing
+	// unboundedly on every subsequent call while lastErr stays set.
 	defer func() {
 		if n <= 0 {
 			return
 		}
 		if waitErr := dl.dls.kickWaiters(); waitErr != nil {
 			fs.Errorf(dl.dls.src, "vfs cache: download write: failed to kick waiters: %v", waitErr)
-			if err == nil {
-				err = waitErr
-			}
 		}
 	}()
 
@@ -517,7 +531,7 @@ loop:
 // should be called on a fresh downloader
 func (dl *downloader) open(offset int64) (err error) {
 	// defer log.Trace(dl.dls.src, "offset=%d", offset)("err=%v", &err)
-	dl.tr = accounting.Stats(dl.dls.ctx).NewTransfer(dl.dls.src)
+	dl.tr = accounting.Stats(dl.dls.ctx).NewTransfer(dl.dls.src, nil)
 
 	size := dl.dls.src.Size()
 	if size < 0 {
@@ -532,7 +546,7 @@ func (dl *downloader) open(offset int64) (err error) {
 	// }
 	// in0, err := operations.NewReOpen(dl.dls.ctx, dl.dls.src, ci.LowLevelRetries, dl.dls.item.c.hashOption, rangeOption)
 
-	in0 := chunkedreader.New(context.TODO(), dl.dls.src, int64(dl.dls.opt.ChunkSize), int64(dl.dls.opt.ChunkSizeLimit))
+	in0 := chunkedreader.New(dl.dls.ctx, dl.dls.src, int64(dl.dls.opt.ChunkSize), int64(dl.dls.opt.ChunkSizeLimit), dl.dls.opt.ChunkStreams)
 	_, err = in0.Seek(offset, 0)
 	if err != nil {
 		return fmt.Errorf("vfs reader: failed to open source file: %w", err)
@@ -550,6 +564,7 @@ func (dl *downloader) open(offset int64) (err error) {
 // close the downloader
 func (dl *downloader) close(inErr error) (err error) {
 	// defer log.Trace(dl.dls.src, "inErr=%v", err)("err=%v", &err)
+	defer vfscommon.RecoverPanic(dl.dls.src, &err)
 	checkErr := func(e error) {
 		if e == nil || errors.Is(err, asyncreader.ErrorStreamAbandoned) {
 			return
@@ -557,17 +572,20 @@ func (dl *downloader) close(inErr error) (err error) {
 		err = e
 	}
 	dl.mu.Lock()
-	if dl.in != nil {
-		checkErr(dl.in.Close())
-		dl.in = nil
-	}
-	if dl.tr != nil {
-		dl.tr.Done(dl.dls.ctx, inErr)
-		dl.tr = nil
-	}
+	defer dl.mu.Unlock()
+	// Mark closed and detach the reader and transfer before closing them:
+	// closing the reader runs backend code, and if that panics the recover
+	// above must not leave the downloader locked or looking still open.
 	dl._closed = true
-	dl.mu.Unlock()
-	return nil
+	in, tr := dl.in, dl.tr
+	dl.in, dl.tr = nil, nil
+	if in != nil {
+		checkErr(in.Close())
+	}
+	if tr != nil {
+		tr.Done(dl.dls.ctx, inErr)
+	}
+	return err
 }
 
 // closed returns true if the downloader has been closed already
@@ -616,6 +634,7 @@ func (dl *downloader) stopAndClose(inErr error) (err error) {
 
 // Start downloading to the local file starting at offset until maxOffset.
 func (dl *downloader) download() (n int64, err error) {
+	defer vfscommon.RecoverPanic(dl.dls.src, &err)
 	// defer log.Trace(dl.dls.src, "")("err=%v", &err)
 	n, err = dl.in.WriteTo(dl)
 	if err != nil && !errors.Is(err, asyncreader.ErrorStreamAbandoned) {

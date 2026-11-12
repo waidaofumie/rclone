@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -30,19 +31,23 @@ type buckets [TokenBucketSlots]*rate.Limiter
 
 // tokenBucket holds info about the rate limiters in use
 type tokenBucket struct {
-	mu          sync.RWMutex // protects the token bucket variables
-	curr        buckets
-	prev        buckets
-	toggledOff  bool
-	currLimitMu sync.Mutex // protects changes to the timeslot
-	currLimit   fs.BwTimeSlot
+	mu         sync.RWMutex // protects the token bucket variables
+	curr       buckets
+	prev       buckets
+	toggledOff bool
+	currLimit  fs.BwTimeSlot
 }
 
 // Return true if limit is disabled
 //
 // Call with lock held
-func (bs *buckets) _isOff() bool {
-	return bs[0] == nil
+func (bs *buckets) _isOff() bool { //nolint:unused // Don't include unused when running golangci-lint in case its on windows where this is not called
+	for i := range bs {
+		if bs[i] != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // Disable the limits
@@ -55,21 +60,25 @@ func (bs *buckets) _setOff() {
 }
 
 const defaultMaxBurstSize = 4 * 1024 * 1024 // must be bigger than the biggest request
+const tokenBucketBurstScale = (256 * 1024 * 1024) / defaultMaxBurstSize
 
-// make a new empty token bucket with the bandwidth given
-func newEmptyTokenBucket(bandwidth fs.SizeSuffix) *rate.Limiter {
+func tokenBucketBurst(bandwidth fs.SizeSuffix) int {
 	// Relate maxBurstSize to bandwidth limit
 	// 4M gives 2.5 Gb/s on Windows
 	// Use defaultMaxBurstSize up to 2GBit/s (256MiB/s) then scale
-	maxBurstSize := (bandwidth * defaultMaxBurstSize) / (256 * 1024 * 1024)
-	if maxBurstSize < defaultMaxBurstSize {
-		maxBurstSize = defaultMaxBurstSize
-	}
+	maxBurstSize := max(bandwidth/tokenBucketBurstScale, defaultMaxBurstSize)
+	maxBurstSize = min(maxBurstSize, fs.SizeSuffix(math.MaxInt))
+	return int(maxBurstSize)
+}
+
+// make a new empty token bucket with the bandwidth given
+func newEmptyTokenBucket(bandwidth fs.SizeSuffix) *rate.Limiter {
+	maxBurstSize := tokenBucketBurst(bandwidth)
 	// fs.Debugf(nil, "bandwidth=%v maxBurstSize=%v", bandwidth, maxBurstSize)
-	tb := rate.NewLimiter(rate.Limit(bandwidth), int(maxBurstSize))
+	tb := rate.NewLimiter(rate.Limit(bandwidth), maxBurstSize)
 	if tb != nil {
 		// empty the bucket
-		err := tb.WaitN(context.Background(), int(maxBurstSize))
+		err := tb.WaitN(context.Background(), maxBurstSize)
 		if err != nil {
 			fs.Errorf(nil, "Failed to empty token bucket: %v", err)
 		}
@@ -106,11 +115,11 @@ func (tb *tokenBucket) StartTokenBucket(ctx context.Context) {
 	if tb.currLimit.Bandwidth.IsSet() {
 		tb.curr = newTokenBucket(tb.currLimit.Bandwidth)
 		fs.Infof(nil, "Starting bandwidth limiter at %v Byte/s", &tb.currLimit.Bandwidth)
-
-		// Start the SIGUSR2 signal handler to toggle bandwidth.
-		// This function does nothing in windows systems.
-		tb.startSignalHandler()
 	}
+
+	// Start the SIGUSR2 signal handler to toggle bandwidth.
+	// This function does nothing in windows systems.
+	tb.startSignalHandler()
 }
 
 // StartTokenTicker creates a ticker to update the bandwidth limiter every minute.
@@ -126,11 +135,9 @@ func (tb *tokenBucket) StartTokenTicker(ctx context.Context) {
 	go func() {
 		for range ticker.C {
 			limitNow := ci.BwLimit.LimitAt(time.Now())
-			tb.currLimitMu.Lock()
+			tb.mu.Lock()
 
 			if tb.currLimit.Bandwidth != limitNow.Bandwidth {
-				tb.mu.Lock()
-
 				// If bwlimit is toggled off, the change should only
 				// become active on the next toggle, which causes
 				// an exchange of tb.curr <-> tb.prev
@@ -156,9 +163,9 @@ func (tb *tokenBucket) StartTokenTicker(ctx context.Context) {
 				}
 
 				tb.currLimit = limitNow
-				tb.mu.Unlock()
 			}
-			tb.currLimitMu.Unlock()
+
+			tb.mu.Unlock()
 		}
 	}()
 }
@@ -235,10 +242,8 @@ func (tb *tokenBucket) rcBwlimit(ctx context.Context, in rc.Params) (out rc.Para
 // Remote control for the token bucket
 func init() {
 	rc.Add(rc.Call{
-		Path: "core/bwlimit",
-		Fn: func(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-			return TokenBucket.rcBwlimit(ctx, in)
-		},
+		Path:  "core/bwlimit",
+		Fn:    TokenBucket.rcBwlimit,
 		Title: "Set the bandwidth limit.",
 		Help: `
 This sets the bandwidth limit to the string passed in. This should be

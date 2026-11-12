@@ -2,18 +2,23 @@ package operations_test
 
 import (
 	"context"
+	"io"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/fstest/mockfs"
+	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// Compare a and b in a file system idependent way
+// Compare a and b in a file system independent way
 func compareListJSONItem(t *testing.T, a, b *operations.ListJSONItem, precision time.Duration) {
 	assert.Equal(t, a.Path, b.Path, "Path")
 	assert.Equal(t, a.Name, b.Name, "Name")
@@ -37,7 +42,6 @@ func compareListJSONItem(t *testing.T, a, b *operations.ListJSONItem, precision 
 func TestListJSON(t *testing.T) {
 	ctx := context.Background()
 	r := fstest.NewRun(t)
-	defer r.Finalise()
 	file1 := r.WriteBoth(ctx, "file1", "file1", t1)
 	file2 := r.WriteBoth(ctx, "sub/file2", "sub/file2", t2)
 
@@ -172,6 +176,23 @@ func TestListJSON(t *testing.T) {
 				ModTime: operations.Timestamp{When: t1},
 				IsDir:   false,
 			}},
+		}, {
+			name: "Metadata",
+			opt: operations.ListJSONOpt{
+				FilesOnly: false,
+				Metadata:  true,
+			},
+			want: []*operations.ListJSONItem{{
+				Path:    "file1",
+				Name:    "file1",
+				Size:    5,
+				ModTime: operations.Timestamp{When: t1},
+				IsDir:   false,
+			}, {
+				Path:  "sub",
+				Name:  "sub",
+				IsDir: true,
+			}},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -190,6 +211,15 @@ func TestListJSON(t *testing.T) {
 					assert.Equal(t, "", got[i].MimeType)
 				} else {
 					assert.NotEqual(t, "", got[i].MimeType)
+				}
+				if test.opt.Metadata {
+					features := r.Fremote.Features()
+					if features.ReadMetadata && !got[i].IsDir {
+						assert.Greater(t, len(got[i].Metadata), 0, "Expecting metadata for file")
+					}
+					if features.ReadDirMetadata && got[i].IsDir {
+						assert.Greater(t, len(got[i].Metadata), 0, "Expecting metadata for dir")
+					}
 				}
 				if test.opt.ShowHash {
 					hashes := got[i].Hashes
@@ -232,7 +262,6 @@ func TestListJSON(t *testing.T) {
 func TestStatJSON(t *testing.T) {
 	ctx := context.Background()
 	r := fstest.NewRun(t)
-	defer r.Finalise()
 	file1 := r.WriteBoth(ctx, "file1", "file1", t1)
 	file2 := r.WriteBoth(ctx, "sub/file2", "sub/file2", t2)
 
@@ -275,6 +304,15 @@ func TestStatJSON(t *testing.T) {
 		}, {
 			name:   "Dir",
 			remote: "sub",
+			opt:    operations.ListJSONOpt{},
+			want: &operations.ListJSONItem{
+				Path:  "sub",
+				Name:  "sub",
+				IsDir: true,
+			},
+		}, {
+			name:   "DirWithTrailingSlash",
+			remote: "sub/",
 			opt:    operations.ListJSONOpt{},
 			want: &operations.ListJSONItem{
 				Path:  "sub",
@@ -370,4 +408,90 @@ func TestStatJSON(t *testing.T) {
 		// This should return an error except for bucket based remotes
 		assert.True(t, err != nil || f.Features().BucketBased, "Need an error for non bucket based backends")
 	})
+}
+
+// TestStatJSONMemory tests StatJSON against the memory backend.
+//
+// The memory backend is bucket based and implements ListP, so this
+// exercises the fast path in StatJSON which lists the target directory
+// itself rather than its (potentially huge) parent. It also checks that
+// the entries listed on that path are accounted in the Listed stats.
+func TestStatJSONMemory(t *testing.T) {
+	ctx := context.Background()
+	f, err := fs.NewFs(ctx, ":memory:")
+	require.NoError(t, err)
+
+	// Check the memory backend triggers the fast path
+	require.True(t, f.Features().BucketBased, "memory backend should be bucket based")
+	require.NotNil(t, f.Features().ListP, "memory backend should implement ListP")
+
+	// Put a file into a subdirectory
+	_, err = operations.Rcat(ctx, f, "sub/file1", io.NopCloser(strings.NewReader("hello")), t1, nil)
+	require.NoError(t, err)
+
+	t.Run("Dir", func(t *testing.T) {
+		accounting.GlobalStats().ResetCounters()
+		got, err := operations.StatJSON(ctx, f, "sub", &operations.ListJSONOpt{})
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, "sub", got.Path)
+		assert.Equal(t, "sub", got.Name)
+		assert.True(t, got.IsDir)
+		// The fast path lists the directory itself - check the entries
+		// it listed were accounted.
+		assert.Positive(t, accounting.GlobalStats().Listed(0), "expected the fast path listing to be accounted")
+	})
+
+	t.Run("DirWithTrailingSlash", func(t *testing.T) {
+		got, err := operations.StatJSON(ctx, f, "sub/", &operations.ListJSONOpt{})
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, "sub", got.Path)
+		assert.True(t, got.IsDir)
+	})
+
+	t.Run("File", func(t *testing.T) {
+		got, err := operations.StatJSON(ctx, f, "sub/file1", &operations.ListJSONOpt{})
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, "sub/file1", got.Path)
+		assert.False(t, got.IsDir)
+	})
+
+	t.Run("NotFound", func(t *testing.T) {
+		got, err := operations.StatJSON(ctx, f, "notfound", &operations.ListJSONOpt{})
+		require.NoError(t, err)
+		assert.Nil(t, got)
+	})
+}
+
+// TestStatJSONConfinement checks that StatJSON never returns an item whose
+// remote escapes the Fs root. StatJSON calls List/NewObject directly and so
+// bypasses the confinement in fs/list and fs/walk - the escaping objects added
+// below would be returned without the guard in StatJSON.
+func TestStatJSONConfinement(t *testing.T) {
+	ctx := context.Background()
+	ff, err := mockfs.NewFs(ctx, "mock", "/", nil)
+	require.NoError(t, err)
+	f := ff.(*mockfs.Fs)
+	f.AddObject(mockobject.Object("ok"))
+	f.AddObject(mockobject.Object(".."))
+	f.AddObject(mockobject.Object("../evil"))
+	f.AddObject(mockobject.Object("/../slashevil"))
+	f.AddObject(mockobject.Object("//../../slashevil2"))
+	f.AddObject(mockobject.Object("/../../etc/passwd"))
+
+	// Escaping remotes are treated as not found, including the leading-slash
+	// variants that path.Clean would anchor as absolute and miss.
+	for _, remote := range []string{"..", "../evil", "/../slashevil", "//../../slashevil2", "/../../etc/passwd"} {
+		got, err := operations.StatJSON(ctx, f, remote, &operations.ListJSONOpt{})
+		require.NoError(t, err, remote)
+		assert.Nil(t, got, remote)
+	}
+
+	// A legitimate remote is still returned.
+	got, err := operations.StatJSON(ctx, f, "ok", &operations.ListJSONOpt{})
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "ok", got.Path)
 }

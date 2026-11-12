@@ -81,13 +81,7 @@ func (x CountSuffix) Unit(unit string) string {
 	if val == "off" {
 		return val
 	}
-	var suffixUnit string
-	if suffix != "" && unit != "" {
-		suffixUnit = suffix + unit
-	} else {
-		suffixUnit = suffix + unit
-	}
-	return val + " " + suffixUnit
+	return val + " " + suffix + unit
 }
 
 func (x *CountSuffix) multiplierFromSymbol(s byte) (found bool, multiplier float64) {
@@ -145,16 +139,22 @@ func (x *CountSuffix) Set(s string) error {
 	if err != nil {
 		return err
 	}
+	if math.IsNaN(value) {
+		return fmt.Errorf("size must be a number %q", s)
+	}
 	if value < 0 {
 		return fmt.Errorf("size can't be negative %q", s)
 	}
 	value *= multiplier
+	if value >= float64(CountSuffixMaxValue) {
+		return fmt.Errorf("value can't be greater than %d", int64(CountSuffixMaxValue))
+	}
 	*x = CountSuffix(value)
 	return nil
 }
 
 // Type of the value
-func (x *CountSuffix) Type() string {
+func (x CountSuffix) Type() string {
 	return "CountSuffix"
 }
 
